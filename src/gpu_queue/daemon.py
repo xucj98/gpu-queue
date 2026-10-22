@@ -192,6 +192,8 @@ class Daemon:
         gpu_list = ','.join(map(str, indices))
         command = job['command'].replace('{gpus}', ' '.join(map(str, indices))).replace('{gpu}', str(indices[0]))
         env = json.loads(job['env'])
+        if host != config_module.LOCAL:     # a proxy on this machine's loopback is not on the others
+            env = {key: value for key, value in env.items() if not key.lower().endswith('_proxy')}
         env.update(GQ_JOB_ID=str(job_id), GQ_HOST=host, GQ_GPUS=gpu_list, CUDA_DEVICE_ORDER='PCI_BUS_ID')
         if job['mask']:
             env['CUDA_VISIBLE_DEVICES'] = gpu_list
