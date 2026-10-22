@@ -96,7 +96,16 @@ def cmd_submit(conf, conn, args):
                        hosts=args.host, mask=0 if args.no_mask else 1, priority=args.priority)
     print(job_id, flush=True)
     if args.wait:
-        return cmd_wait(conf, conn, argparse.Namespace(ids=[job_id], timeout=None, quiet=False))
+        # Like srun: stopping the waiting client (Ctrl-C, or a batch runner's SIGTERM) cancels the job.
+        def stop(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stop)
+        try:
+            return cmd_wait(conf, conn, argparse.Namespace(ids=[job_id], timeout=None, quiet=False))
+        except KeyboardInterrupt:
+            db.cancel(conn, job_id)
+            print(f'gq: cancelled job {job_id}', file=sys.stderr, flush=True)
+            return 130
 
 
 def cmd_ls(conf, conn, args):

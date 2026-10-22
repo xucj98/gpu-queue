@@ -31,6 +31,7 @@ gq gpus          # 各机器每张卡的显存、利用率（当前 / 30 s 内�
 gq log -f 12     # 任务输出，也在 <shared_dir>/logs/12.log
 gq cancel 12 13  # 排队中的直接取消；运行中的给进程组发 SIGTERM，20 s 后 SIGKILL
 gq wait 12 13    # 每次状态变化打印一行；全部成功退出码为 0，否则为 1
+gq submit --wait -- CMD   # 提交并等待（退出码同 gq wait）；中断或终止这个客户端会取消任务，可作为批量脚本的 --launcher 前缀
 gq show 12
 ```
 
