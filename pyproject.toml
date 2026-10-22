@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpu-queue"
+version = "0.1.0"
+description = "A GPU job queue over a few SSH-reachable machines sharing a filesystem"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+gq = "gpu_queue.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
