@@ -8,6 +8,7 @@ unless it is gone or a zombie (the containers' init does not reap orphans).
 """
 
 from dataclasses import dataclass
+import math
 import subprocess
 
 from gpu_queue.config import LOCAL
@@ -40,28 +41,44 @@ class Gpu:
     apps: list      # [(nvidia-smi pid, GB)]
 
 
+@dataclass
+class Host:
+    host: str
+    cpus: int
+    load1: float
+    ram_total: float       # GiB
+    ram_available: float   # GiB, MemAvailable (includes reclaimable cache)
+
+
 # s; a heavily loaded host answers slowly, and a timeout marks it down until the next sample
 SAMPLE_TIMEOUT = 60
 
 SAMPLE = """
-nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits || exit 3
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits || exit 3
+fi
 echo ---
-nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits
+if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader,nounits
+fi
 echo ---
 pids={pids}
 [ -n "$pids" ] && ps -o pid=,stat= -p "$pids" 2>/dev/null | awk '$2 !~ /^Z/ {{print $1}}'
-true
+echo ---
+getconf _NPROCESSORS_ONLN || exit 4
+cut -d ' ' -f 1 /proc/loadavg || exit 4
+awk '/^MemTotal:/ {{print $2 / 1048576}} /^MemAvailable:/ {{print $2 / 1048576}}' /proc/meminfo
 """
 
 
 def sample(config, host, pids=()):
-    """``(gpus, alive)``: the GPUs of ``host`` and which of ``pids`` (container pids) are alive.
+    """``(gpus, alive, resources)`` from one local/SSH command.
 
     One ``ps`` for all pids: a ``ps`` per pid outlasted the timeout with hundreds of running jobs."""
     result = run(config, host, SAMPLE.format(pids=','.join(str(int(p)) for p in pids)), timeout=SAMPLE_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip().splitlines()[-1:] or f'exit {result.returncode}')
-    gpu_part, app_part, alive_part = (result.stdout.split('---\n') + ['', ''])[:3]
+    gpu_part, app_part, alive_part, resource_part = result.stdout.split('---\n')
     apps = {}
     for line in app_part.strip().splitlines():
         fields = [f.strip() for f in line.split(',')]
@@ -72,7 +89,11 @@ def sample(config, host, pids=()):
         index, uuid, name, total, used, util = [f.strip() for f in line.split(',')]
         gpus.append(Gpu(host, int(index), uuid, name, _gb(total), _gb(used), _number(util), apps.get(uuid, [])))
     alive = {int(p) for p in alive_part.split()}
-    return gpus, alive
+    cpus, load1, total, available = map(float, resource_part.split())
+    if not all(math.isfinite(v) for v in (cpus, load1, total, available)) or (
+            cpus <= 0 or load1 < 0 or total <= 0 or not 0 <= available <= total):
+        raise ValueError('invalid host CPU/RAM sample')
+    return gpus, alive, Host(host, int(cpus), load1, total, available)
 
 
 def _gb(mib):

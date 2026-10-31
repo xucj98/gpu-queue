@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS gpus (
     apps TEXT, updated REAL, PRIMARY KEY (host, idx)
 );
 CREATE TABLE IF NOT EXISTS hosts (host TEXT PRIMARY KEY, ok INTEGER, error TEXT, updated REAL);
+CREATE TABLE IF NOT EXISTS host_resources (
+    host TEXT PRIMARY KEY, cpus INTEGER, load1 REAL, ram_total REAL, ram_available REAL, updated REAL
+);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -36,6 +39,22 @@ def connect(config):
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
     conn.executescript(SCHEMA)
+    # Keep the old hosts table's shape: an already-running older daemon inserts four values.
+    # Lock before inspecting columns so simultaneous clients cannot race an ALTER TABLE.
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(jobs)')}
+        for key in ('cpus', 'ram'):
+            if key not in columns:
+                value = float(config.defaults[key])
+                conn.execute(f'ALTER TABLE jobs ADD COLUMN {key} REAL NOT NULL DEFAULT {value}')
+        if 'launch_host' not in columns:
+            conn.execute('ALTER TABLE jobs ADD COLUMN launch_host TEXT')
+        conn.execute('COMMIT')
+    except Exception:
+        conn.execute('ROLLBACK')
+        conn.close()
+        raise
     return conn
 
 

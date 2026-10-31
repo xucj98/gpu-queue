@@ -1,8 +1,9 @@
-"""``gq``: submit GPU jobs to the queue, follow them, see the GPUs.
+"""``gq``: submit jobs with CPU/RAM/GPU budgets, follow them, see host resources.
 
     gq submit [--mem 8] [--util 30] [--window 30] [--gpus 1] [--host H] [--name N] -- COMMAND ...
     gq ls [-a]                 running and pending jobs (-a: and the recently finished)
-    gq gpus                    every host's GPUs: memory, utilisation, the jobs on them
+    gq hosts                   host cores, load1, available RAM, running declarations
+    gq gpus                    host resources and GPUs: memory, utilisation, running jobs
     gq show ID / gq log [-f] ID / gq cancel ID ...
     gq wait ID ...             one line per state change; exits when all finished (0: all succeeded)
     gq daemon [status|stop|restart|run]
@@ -14,6 +15,7 @@ the first; the job also sees ``GQ_GPUS`` (comma separated) and, unless ``--no-ma
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -29,6 +31,20 @@ ENV_SKIP = {'CUDA_VISIBLE_DEVICES', 'SSH_AUTH_SOCK', 'SSH_CLIENT', 'SSH_CONNECTI
             'HOSTNAME', 'PWD', 'OLDPWD', 'SHLVL', '_', 'TMUX', 'TMUX_PANE', 'TERM_SESSION_ID', 'XDG_RUNTIME_DIR'}
 
 
+def _positive(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError('must be positive and finite')
+    return number
+
+
+def _gpu_count(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError('must be >= 0 (0 for CPU-only jobs)')
+    return number
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='gq', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
@@ -39,10 +55,14 @@ def main(argv=None):
     p.add_argument('--name')
     p.add_argument('--owner', default=os.environ.get('GQ_OWNER'), help='default: $GQ_OWNER, else the directory name')
     p.add_argument('--mem', type=float, default=defaults['mem'], help=f'GB free on each GPU (default {defaults["mem"]:g})')
+    p.add_argument('--cpus', type=_positive, default=defaults['cpus'],
+                   help=f'logical cores per job, may be fractional (default {defaults["cpus"]:g})')
+    p.add_argument('--ram', type=_positive, default=defaults['ram'],
+                   help=f'GiB RAM per job (default {defaults["ram"]:g})')
     p.add_argument('--util', type=float, default=defaults['util'],
                    help=f'utilisation below this %% over the window (default {defaults["util"]:g})')
     p.add_argument('--window', type=float, default=defaults['window'], help=f'seconds (default {defaults["window"]:g})')
-    p.add_argument('--gpus', type=int, default=1, help='GPUs, on one host (default 1)')
+    p.add_argument('--gpus', type=_gpu_count, default=1, help='GPUs on one host; 0 for CPU-only (default 1)')
     p.add_argument('--host', action='append', help='allowed host (repeatable; default any)')
     p.add_argument('--priority', type=int, default=0, help='higher first (default 0)')
     p.add_argument('--no-mask', action='store_true', help='do not set CUDA_VISIBLE_DEVICES')
@@ -55,6 +75,7 @@ def main(argv=None):
     p.add_argument('--since', type=float, default=6.)
     p.add_argument('--owner')
     sub.add_parser('gpus', help="the hosts' GPUs and the jobs on them")
+    sub.add_parser('hosts', help='host CPU/RAM samples and running job declarations')
     p = sub.add_parser('show', help="a job's details")
     p.add_argument('id', type=int)
     p = sub.add_parser('log', help="a job's output")
@@ -74,7 +95,7 @@ def main(argv=None):
     if args.cmd == 'daemon' and args.action == 'run':
         return daemon.main()
     conn = db.connect(conf)
-    if args.cmd in ('submit', 'ls', 'gpus', 'wait'):
+    if args.cmd in ('submit', 'ls', 'gpus', 'hosts', 'wait'):
         daemon.ensure(conf)
     return globals()['cmd_' + args.cmd](conf, conn, args) or 0
 
@@ -93,6 +114,7 @@ def cmd_submit(conf, conn, args):
     job_id = db.submit(conn, name=args.name or _default_name(command),
                        owner=args.owner or args.cwd.resolve().name, command=line, cwd=str(args.cwd.resolve()),
                        env=env, mem=args.mem, util=args.util, window=args.window, ngpus=args.gpus,
+                       cpus=args.cpus, ram=args.ram,
                        hosts=args.host, mask=0 if args.no_mask else 1, priority=args.priority)
     print(job_id, flush=True)
     if args.wait:
@@ -116,8 +138,9 @@ def cmd_ls(conf, conn, args):
     now = time.time()
     print(_daemon_line(conf, conn))
     print(f'\nRUNNING ({len(running)})')
-    _table([('ID', 'NAME', 'OWNER', 'HOST:GPU', 'MEM', 'ELAPSED', 'STATE')] + [
-        (j['id'], _cut(j['name'], 24), _cut(j['owner'], 16), f'{j["host"]}:{j["gpus"]}', f'{j["mem"]:g}G',
+    _table([('ID', 'NAME', 'OWNER', 'HOST:GPU', 'GPU MEM', 'CPUS', 'RAM', 'ELAPSED', 'STATE')] + [
+        (j['id'], _cut(j['name'], 24), _cut(j['owner'], 16), f'{j["host"]}:{j["gpus"] or "-"}', f'{j["mem"]:g}G',
+         f'{j["cpus"]:g}', f'{j["ram"]:g}G',
          _duration(now - j['started']), j['state']) for j in running])
     print(f'\nPENDING ({len(pending)})')
     _table([('#', 'ID', 'NAME', 'OWNER', 'NEEDS', 'WAITING', 'REASON')] + [
@@ -136,9 +159,13 @@ def cmd_ls(conf, conn, args):
 def cmd_gpus(conf, conn, args):
     now = time.time()
     print(_daemon_line(conf, conn))
+    _host_table(conf, conn, now)
+    print()
     jobs_on = {}
     for job in db.jobs(conn, "state IN ('running', 'cancelling')"):
-        for idx in job['gpus'].split(','):
+        for idx in (job['gpus'] or '').split(','):
+            if not idx:
+                continue
             jobs_on.setdefault((job['host'], int(idx)), []).append(job)
     host_rows = {row['host']: row for row in conn.execute('SELECT * FROM hosts')}
     rows = [('HOST', 'GPU', 'NAME', 'MEM USED/TOTAL', 'FREE', 'UTIL', 'MAX', 'PROCS', 'GQ JOBS')]
@@ -157,6 +184,32 @@ def cmd_gpus(conf, conn, args):
     _table(rows)
     print(f'\nMAX: highest utilisation over the last {conf.defaults["window"]:g} s. PROCS: GPU processes '
           '(any owner; nvidia-smi pids are host pids, not matched to jobs).')
+
+
+def cmd_hosts(conf, conn, args):
+    print(_daemon_line(conf, conn))
+    _host_table(conf, conn, time.time())
+
+
+def _host_table(conf, conn, now):
+    states = {row['host']: row for row in conn.execute('SELECT * FROM hosts')}
+    samples = {row['host']: row for row in conn.execute('SELECT * FROM host_resources')}
+    running = db.jobs(conn, "state IN ('running', 'cancelling')")
+    rows = [('HOST', 'CORES', 'LOAD1', 'CPU TARGET', 'RAM AVAIL/TOTAL', 'GQ CPUS', 'GQ RAM', 'SAMPLE')]
+    for host in conf.hosts:
+        state, resource = states.get(host), samples.get(host)
+        jobs = [j for j in running if j['host'] == host]
+        cpus, ram = sum(j['cpus'] for j in jobs), sum(j['ram'] for j in jobs)
+        if not state or not state['ok'] or not resource:
+            status = f'DOWN: {_cut(state["error"], 60)}' if state and not state['ok'] else 'still sampling'
+            rows.append((host, '-', '-', '-', '-', f'{cpus:g}', f'{ram:g}G', status))
+        else:
+            rows.append((host, resource['cpus'], f'{resource["load1"]:.2f}',
+                         f'{resource["cpus"] * conf.cpu_target:.2f}',
+                         f'{resource["ram_available"]:.1f}/{resource["ram_total"]:.1f}G',
+                         f'{cpus:g}', f'{ram:g}G', _ago(now - resource['updated'])))
+    _table(rows)
+    print('  GQ CPUS/RAM: declarations of running/cancelling jobs; not measured usage. RAM: GiB.')
 
 
 def cmd_show(conf, conn, args):
@@ -260,7 +313,8 @@ def _daemon_line(conf, conn):
 
 def _needs(job):
     hosts = json.loads(job['hosts']) if job['hosts'] else None
-    text = f'{job["ngpus"]}x >={job["mem"]:g}G, <{job["util"]:g}%/{job["window"]:g}s'
+    gpu = f'{job["ngpus"]}x >={job["mem"]:g}G, <{job["util"]:g}%/{job["window"]:g}s' if job['ngpus'] else 'CPU-only'
+    text = f'{job["cpus"]:g} CPU, {job["ram"]:g}G RAM; {gpu}'
     return text + (f' @{",".join(hosts)}' if hosts else '')
 
 

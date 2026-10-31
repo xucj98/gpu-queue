@@ -1,6 +1,6 @@
 """The daemon: one per machine (a lock in the state directory), started by the CLI when needed.
 
-Every ``poll`` seconds it samples each host's GPUs over SSH (with the liveness of its running
+Every ``poll`` seconds it samples each host's CPU/RAM and GPUs over SSH (with the liveness of its running
 jobs), finishes jobs whose exit code appeared, kills cancelled ones, and starts pending jobs that
 fit (:mod:`gpu_queue.schedule`). A job runs as ``setsid bash <shared>/jobs/<id>.sh`` on its host;
 the script records its pid, runs the command in the submission's directory and environment, then
@@ -91,10 +91,10 @@ class Daemon:
         futures = {host: self.pool.submit(hosts.sample, self.conf, host,
                                           [pids[j['id']] for j in active if j['host'] == host and pids[j['id']]])
                    for host in self.conf.hosts}
-        gpus, alive, up = [], {}, set()
+        gpus, alive, up, resources = [], {}, set(), []
         for host, future in futures.items():
             try:
-                host_gpus, alive[host] = future.result()
+                host_gpus, alive[host], resource = future.result()
             except Exception as error:
                 log.warning('%s: %s', host, error)
                 self.history.forget(host)
@@ -102,13 +102,16 @@ class Daemon:
                 continue
             up.add(host)
             gpus += host_gpus
+            resources.append(resource)
+            self.conn.execute('INSERT OR REPLACE INTO host_resources VALUES (?, ?, ?, ?, ?, ?)',
+                              (host, resource.cpus, resource.load1, resource.ram_total, resource.ram_available, now))
             self.conn.execute('INSERT OR REPLACE INTO hosts VALUES (?, 1, NULL, ?)', (host, now))
         self.history.add(now, gpus)
         self.snapshot(gpus, now)
         for job in active:
             if job['host'] in up:
                 self.follow(job, pids[job['id']], alive[job['host']], now)
-        self.start_jobs(gpus, now)
+        self.start_jobs(gpus, resources, now)
 
     def snapshot(self, gpus, now):
         window = self.conf.defaults['window']
@@ -161,21 +164,24 @@ class Daemon:
             log.info('job %d lost', job['id'])
 
     # -- starting ----------------------------------------------------------------------
-    def start_jobs(self, gpus, now):
+    def start_jobs(self, gpus, resources, now):
         pending = db.jobs(self.conn, "state = 'pending'")
         if not pending:
             return
         running = db.jobs(self.conn, "state IN ('running', 'cancelling')")
-        placements, reasons = schedule.place(pending, gpus, self.history, running, now, self.conf.warmup)
+        placements, reasons = schedule.place(pending, gpus, self.history, running, now, self.conf.warmup,
+                                            resources, self.conf.cpu_target, self.conf.ram_reserve)
         for job_id, reason in reasons.items():
             db.update(self.conn, job_id, reason=reason)
         used = {(gpu.host, gpu.idx): gpu.used for gpu in gpus}
+        host_samples = {h.host: {'load1': h.load1, 'ram_available': h.ram_available} for h in resources}
         for job, host, indices in placements:
             # Claim it first: a `gq cancel` in between leaves it cancelled.
             claimed = self.conn.execute("UPDATE jobs SET state = 'running', started = ?, host = ?, gpus = ?, "
-                                        "launch_used = ?, reason = NULL WHERE id = ? AND state = 'pending'",
+                                        "launch_used = ?, launch_host = ?, reason = NULL WHERE id = ? AND state = 'pending'",
                                         (now, host, ','.join(map(str, indices)),
-                                         json.dumps({str(i): used[(host, i)] for i in indices}), job['id'])).rowcount
+                                         json.dumps({str(i): used[(host, i)] for i in indices}),
+                                         json.dumps(host_samples[host]), job['id'])).rowcount
             if not claimed:
                 continue
             try:
@@ -190,7 +196,7 @@ class Daemon:
         for path in (conf.pid_file(job_id), conf.exit_file(job_id)):
             path.unlink(missing_ok=True)
         gpu_list = ','.join(map(str, indices))
-        command = job['command'].replace('{gpus}', ' '.join(map(str, indices))).replace('{gpu}', str(indices[0]))
+        command = job['command'].replace('{gpus}', ' '.join(map(str, indices))).replace('{gpu}', str(indices[0]) if indices else '')
         env = json.loads(job['env'])
         if host != config_module.LOCAL:     # a proxy on this machine's loopback is not on the others
             env = {key: value for key, value in env.items() if not key.lower().endswith('_proxy')}
