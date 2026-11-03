@@ -29,3 +29,20 @@ def test_invalid_resource_defaults(tmp_path, monkeypatch, setting):
     monkeypatch.setenv('GQ_CONFIG', str(path))
     with pytest.raises(ValueError):
         config.load()
+
+
+def test_host_table_shows_container_cpu_and_sampling_state(tmp_path, capsys):
+    from gpu_queue import db
+    conf = config.Config(state_dir=tmp_path, hosts=['a'])
+    conn = db.connect(conf)
+    conn.execute("INSERT INTO hosts VALUES ('a', 1, NULL, 100)")
+    conn.execute("INSERT INTO host_resources VALUES ('a', 55.5, NULL, 100, 90, 100)")
+    cli._host_table(conf, conn, 101.)
+    text = capsys.readouterr().out
+    assert 'CPU USED 1m' in text and 'LOAD1' not in text
+    assert 'CPU still sampling (60 s)' in text
+    conn.execute("UPDATE host_resources SET cpu_used = 1.25 WHERE host = 'a'")
+    cli._host_table(conf, conn, 101.)
+    text = capsys.readouterr().out
+    assert '55.5' in text and '1.25' in text and f'{55.5 * .85:.2f}' in text
+    conn.close()

@@ -8,6 +8,7 @@
 
 ```bash
 pipx install -e /mnt/public/xcj/tools/gpu-queue
+gq daemon restart   # 安装或升级后重启采样与调度进程
 ```
 
 配置文件在 `~/.config/gpu-queue/config.toml`，各项都可以省略（见 `src/gpu_queue/config.py`）：
@@ -15,7 +16,7 @@ pipx install -e /mnt/public/xcj/tools/gpu-queue
 ```toml
 hosts = ["localhost", "wuwen-4090-2", "wuwen-4090-3"]   # localhost：本机，不走 SSH
 shared_dir = "/mnt/public/xcj/cache/gpu-queue"           # 任务脚本、日志、退出码
-cpu_target = 0.85                                     # 最多使用逻辑核数的 85%
+cpu_target = 0.85                                     # 最多使用容器可用核数的 85%
 ram_reserve = 0.05                                    # 留出总内存的 5%
 
 [defaults]                                           # 每个任务的默认申报量
@@ -26,6 +27,7 @@ ram = 4.0                                            # GiB，整件任务合计
 对每台机器的要求：
 - 本机能免密 SSH 到它。
 - 它看到的 `shared_dir` 和任务工作目录与本机是同一路径。
+- 安装 Python 3，使用 cgroup v2，并能读取当前容器的 `cpu.stat`、`cpu.max`。
 
 ## 使用
 
@@ -35,7 +37,7 @@ gq submit --gpus 2 --host wuwen-4090-2 --name sweep -- 'python a.py && python b.
 gq submit --cpus 1.5 --ram 4 --mem 2 --util 85 -- python isaac_cpu.py
 gq submit --gpus 0 --cpus 8 --ram 16 -- python cpu_only.py
 gq ls            # 运行中（机器:GPU、已运行时长）与排队中（顺序、等待原因）；-a 加上最近结束的
-gq hosts         # 各机器核数、load1、可用内存、运行任务的 CPU/内存申报合计
+gq hosts         # 各容器可用核数、过去 1 分钟平均 CPU 用量、可用内存、运行任务的 CPU/内存申报合计
 gq gpus          # 同上，加每张卡的显存、利用率（当前 / 30 s 内最高）和卡上的 gq 任务
 gq log -f 12     # 任务输出，也在 <shared_dir>/logs/12.log
 gq cancel 12 13  # 排队中的直接取消；运行中的给进程组发 SIGTERM，20 s 后 SIGKILL
@@ -49,12 +51,14 @@ gq show 12
 `--cpus` 是任务需要的逻辑核数，`--ram` 是任务合计需要的 GiB 内存，支持小数。默认 1.5 核、4 GiB，来自三台机器上 31 个 Isaac CPU 任务的进程组采样：平均约 1.06 核，RSS 最大 2.63 GiB。其他负载按实际需要申报，例如多线程训练应调高 `--cpus`。
 
 每台机器同时满足：
-- **CPU**：有效已用核数加本任务 `--cpus`，不超过逻辑核数 × `cpu_target`（默认 0.85）。
+- **CPU**：有效已用核数加本任务 `--cpus`，不超过容器可用核数 × `cpu_target`（默认 0.85）。
 - **内存**：本任务 `--ram` 不超过 `MemAvailable` 减去启动预留，再减去总内存 × `ram_reserve`（默认 0.05）。
 
-**启动预留**：`warmup` 秒内（默认 120 s），CPU 取实测 1 分钟 loadavg 与“启动时负载 + 此后启动任务的核数申报合计”中的较大值；内存预留尚未兑现的申报量，主机整体的内存增长只抵扣一次。同一轮启动的任务也立即扣除预算，避免启动初期负载还没上升就放入过多任务。排在前面但放不下的任务仍不阻塞后面的较小任务。
+**启动预留**：`warmup` 秒内（默认 120 s），CPU 取容器过去 60 s 的平均 CPU 占用核数与“启动时平均 CPU 用量 + 此后启动任务的核数申报合计”中的较大值；内存预留尚未兑现的申报量，主机整体的内存增长只抵扣一次。同一轮启动的任务也立即扣除预算，避免启动初期平均 CPU 用量还没上升就放入过多任务。排在前面但放不下的任务仍不阻塞后面的较小任务。
 
-CPU 和内存是调度申报，不是进程的硬限制。loadavg 包含等待 I/O 的任务，可能比实际忙碌核数更保守。`gq ls` 的等待原因会注明 `CPU` 或 `RAM`；`gq hosts` 的 `GQ CPUS/RAM` 是正在运行（含取消中）任务的申报总量，不是实测用量。
+`CPU USED 1m` 是当前容器及其子 cgroup 过去 60 s 平均占用的核数，包括绕过 gq 启动的任务。每次采样读取 `cpu.stat` 的累计 `usage_usec`，以远端单调时钟计算固定 60 s 窗口的时间加权均值；窗口边界落在两次采样之间时，按该区间平均速率插值。它统计实际 CPU time，不计等待 I/O 的时间。`CORES` 取进程可用 CPU 集合大小和可见 cgroup 层级 CPU quota 核数中的最小值，支持小数。
+
+Daemon 启动、机器恢复、容器替换、计数回退或采样中断超过 60 s 后，先积累完整的 60 s 窗口；期间显示 `CPU still sampling (60 s)`，不向该机器启动新任务，已运行任务继续跟踪。CPU 和内存是调度申报，不是进程的硬限制。`gq ls` 的等待原因会注明 `CPU` 或 `RAM`；`gq hosts` 的 `GQ CPUS/RAM` 是正在运行（含取消中）任务的申报总量，不是实测用量。
 
 **纯 CPU 任务**：`--gpus 0` 不分配 GPU、不检查显存和利用率窗口，只检查 CPU 和内存；默认把 `CUDA_VISIBLE_DEVICES` 设为空。支持未安装 `nvidia-smi` 的 CPU 主机。
 
@@ -105,7 +109,7 @@ CPU 和内存是调度申报，不是进程的硬限制。loadavg 包含等待 I
 - 日志在状态目录里。
 
 **每 `poll` 秒（默认 5 s）的工作**
-- 每台机器只发一次命令，通过复用的 SSH 连接采样 `nvidia-smi`、逻辑核数、`/proc/loadavg`、`/proc/meminfo`，同时检查各任务的进程是否还在。
+- 每台机器只发一次命令，通过复用的 SSH 连接采样 `nvidia-smi`、cgroup CPU 累计用量及容量、远端单调时钟、`/proc/meminfo`，同时检查各任务的进程是否还在。
 - 已写出退出码的任务记为结束。
 - 已取消的任务把进程杀掉。
 - 排队中放得下的任务按优先级、再按提交顺序启动（见 `src/gpu_queue/schedule.py`）。排在前面但放不下的任务，不会挡住后面放得下的任务。
@@ -118,7 +122,7 @@ CPU 和内存是调度申报，不是进程的硬限制。loadavg 包含等待 I
 **状态存放**
 - 任务状态在共享盘的文件里，调度进程重启后能接着管理正在跑的任务。
 - 队列数据库是状态目录里的 SQLite，放在本机本地磁盘上。
-- 升级 CPU/内存调度时会自动给旧任务补默认申报量，保留任务状态、优先级、日志与进程。重启 daemon 不终止任务；已有的启动采样保存在数据库里，重启后仍用于预留。没有启动采样的旧任务在剩余 `warmup` 内保守预留全额。GPU 利用率历史需要重新积累一个窗口。
+- 升级 CPU/内存调度时会自动给旧任务补默认申报量，保留任务状态、优先级、日志与进程。重启 daemon 不终止任务；已有的启动采样保存在数据库里，重启后仍用于预留。没有同口径 CPU 启动采样的旧任务在剩余 `warmup` 内保守预留全额。升级会清除旧的主机负载采样，保留任务及其日志。CPU 用量历史需要重新积累完整 60 s，GPU 利用率历史也需要重新积累一个窗口。
 
 **容器里的进程号**
 

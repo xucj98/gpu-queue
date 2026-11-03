@@ -5,7 +5,7 @@
     state_dir = "~/.local/state/gpu-queue"    # the queue database, on the local disk
     poll = 5            # s between host/GPU samples
     warmup = 120        # s for CPU/RAM/GPU startup reservations
-    cpu_target = 0.85   # fraction of logical cores
+    cpu_target = 0.85   # fraction of container CPU capacity
     ram_reserve = 0.05  # fraction of total RAM kept free
     [defaults]          # of `gq submit`
     mem = 4.0           # GB free

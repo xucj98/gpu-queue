@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS gpus (
 );
 CREATE TABLE IF NOT EXISTS hosts (host TEXT PRIMARY KEY, ok INTEGER, error TEXT, updated REAL);
 CREATE TABLE IF NOT EXISTS host_resources (
-    host TEXT PRIMARY KEY, cpus INTEGER, load1 REAL, ram_total REAL, ram_available REAL, updated REAL
+    host TEXT PRIMARY KEY, cpus REAL, cpu_used REAL, ram_total REAL, ram_available REAL, updated REAL
 );
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -50,6 +50,12 @@ def connect(config):
                 conn.execute(f'ALTER TABLE jobs ADD COLUMN {key} REAL NOT NULL DEFAULT {value}')
         if 'launch_host' not in columns:
             conn.execute('ALTER TABLE jobs ADD COLUMN launch_host TEXT')
+        resource_columns = {row['name'] for row in conn.execute('PRAGMA table_info(host_resources)')}
+        if 'load1' in resource_columns:
+            # These are transient samples, not job state. Never reuse values of the old metric.
+            conn.execute('DROP TABLE host_resources')
+            conn.execute('CREATE TABLE host_resources (host TEXT PRIMARY KEY, cpus REAL, cpu_used REAL, '
+                         'ram_total REAL, ram_available REAL, updated REAL)')
         conn.execute('COMMIT')
     except Exception:
         conn.execute('ROLLBACK')

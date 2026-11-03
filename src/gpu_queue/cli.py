@@ -2,7 +2,7 @@
 
     gq submit [--mem 8] [--util 30] [--window 30] [--gpus 1] [--host H] [--name N] -- COMMAND ...
     gq ls [-a]                 running and pending jobs (-a: and the recently finished)
-    gq hosts                   host cores, load1, available RAM, running declarations
+    gq hosts                   container cores, 60 s CPU usage, available RAM, running declarations
     gq gpus                    host resources and GPUs: memory, utilisation, running jobs
     gq show ID / gq log [-f] ID / gq cancel ID ...
     gq wait ID ...             one line per state change; exits when all finished (0: all succeeded)
@@ -195,7 +195,7 @@ def _host_table(conf, conn, now):
     states = {row['host']: row for row in conn.execute('SELECT * FROM hosts')}
     samples = {row['host']: row for row in conn.execute('SELECT * FROM host_resources')}
     running = db.jobs(conn, "state IN ('running', 'cancelling')")
-    rows = [('HOST', 'CORES', 'LOAD1', 'CPU TARGET', 'RAM AVAIL/TOTAL', 'GQ CPUS', 'GQ RAM', 'SAMPLE')]
+    rows = [('HOST', 'CORES', 'CPU USED 1m', 'CPU TARGET', 'RAM AVAIL/TOTAL', 'GQ CPUS', 'GQ RAM', 'SAMPLE')]
     for host in conf.hosts:
         state, resource = states.get(host), samples.get(host)
         jobs = [j for j in running if j['host'] == host]
@@ -204,11 +204,14 @@ def _host_table(conf, conn, now):
             status = f'DOWN: {_cut(state["error"], 60)}' if state and not state['ok'] else 'still sampling'
             rows.append((host, '-', '-', '-', '-', f'{cpus:g}', f'{ram:g}G', status))
         else:
-            rows.append((host, resource['cpus'], f'{resource["load1"]:.2f}',
+            cpu_used = '-' if resource['cpu_used'] is None else f'{resource["cpu_used"]:.2f}'
+            status = 'CPU still sampling (60 s)' if resource['cpu_used'] is None else _ago(now - resource['updated'])
+            rows.append((host, f'{resource["cpus"]:g}', cpu_used,
                          f'{resource["cpus"] * conf.cpu_target:.2f}',
                          f'{resource["ram_available"]:.1f}/{resource["ram_total"]:.1f}G',
-                         f'{cpus:g}', f'{ram:g}G', _ago(now - resource['updated'])))
+                         f'{cpus:g}', f'{ram:g}G', status))
     _table(rows)
+    print('  CPU USED 1m: container CPU cores used, mean over the last 60 s. CPU TARGET: cores.')
     print('  GQ CPUS/RAM: declarations of running/cancelling jobs; not measured usage. RAM: GiB.')
 
 

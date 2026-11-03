@@ -30,3 +30,23 @@ def test_migration_preserves_running_and_pending_jobs_and_old_daemon_inserts(tmp
     reopened.close()
     upgraded.close()
     legacy.close()
+
+
+def test_replaces_legacy_resource_metric_without_losing_jobs(tmp_path):
+    conf = Config(state_dir=tmp_path)
+    legacy = sqlite3.connect(conf.db, isolation_level=None)
+    legacy.executescript(db.SCHEMA.replace('cpus REAL, cpu_used REAL', 'cpus INTEGER, load1 REAL'))
+    legacy.execute("INSERT INTO host_resources VALUES ('a', 56, 100, 448, 440, 100)")
+    fields = dict(command='sleep 10', cwd='/tmp', env={}, mem=4., util=30., window=30., ngpus=1, mask=1, priority=0)
+    job_id = db.submit(legacy, **fields)
+    db.update(legacy, job_id, state='running', started=100., launch_used='{}')
+    legacy.close()
+    conn = db.connect(conf)
+    assert 'load1' not in {row['name'] for row in conn.execute('PRAGMA table_info(host_resources)')}
+    assert not list(conn.execute('SELECT * FROM host_resources'))
+    assert db.job(conn, job_id)['state'] == 'running'
+    conn.execute("INSERT INTO host_resources VALUES ('a', 55.5, NULL, 448, 440, 101)")
+    reopened = db.connect(conf)
+    assert reopened.execute('SELECT cpus FROM host_resources').fetchone()[0] == 55.5
+    reopened.close()
+    conn.close()

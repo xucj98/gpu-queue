@@ -18,7 +18,7 @@ import subprocess
 import sys
 import time
 
-from gpu_queue import config as config_module, db, hosts, schedule
+from gpu_queue import config as config_module, cpu, db, hosts, schedule
 
 KILL_AFTER = 20.     # s after SIGTERM, SIGKILL
 LOST_AFTER = 3       # samples with the job's process gone and no exit code
@@ -61,6 +61,7 @@ class Daemon:
         self.conf = conf
         self.conn = db.connect(conf)
         self.history = schedule.History()
+        self.cpu_history = cpu.History()
         self.missing = {}       # job id -> samples with its process gone
         self.killed = {}        # job id -> time of SIGTERM
         self.pool = ThreadPoolExecutor(max(4, len(conf.hosts)))
@@ -98,13 +99,15 @@ class Daemon:
             except Exception as error:
                 log.warning('%s: %s', host, error)
                 self.history.forget(host)
+                self.cpu_history.forget(host)
                 self.conn.execute('INSERT OR REPLACE INTO hosts VALUES (?, 0, ?, ?)', (host, str(error), now))
                 continue
+            resource.cpu_used = self.cpu_history.add(resource)
             up.add(host)
             gpus += host_gpus
             resources.append(resource)
             self.conn.execute('INSERT OR REPLACE INTO host_resources VALUES (?, ?, ?, ?, ?, ?)',
-                              (host, resource.cpus, resource.load1, resource.ram_total, resource.ram_available, now))
+                              (host, resource.cpus, resource.cpu_used, resource.ram_total, resource.ram_available, now))
             self.conn.execute('INSERT OR REPLACE INTO hosts VALUES (?, 1, NULL, ?)', (host, now))
         self.history.add(now, gpus)
         self.snapshot(gpus, now)
@@ -174,7 +177,7 @@ class Daemon:
         for job_id, reason in reasons.items():
             db.update(self.conn, job_id, reason=reason)
         used = {(gpu.host, gpu.idx): gpu.used for gpu in gpus}
-        host_samples = {h.host: {'load1': h.load1, 'ram_available': h.ram_available} for h in resources}
+        host_samples = {h.host: {'cpu_used': h.cpu_used, 'ram_available': h.ram_available} for h in resources}
         for job, host, indices in placements:
             # Claim it first: a `gq cancel` in between leaves it cancelled.
             claimed = self.conn.execute("UPDATE jobs SET state = 'running', started = ?, host = ?, gpus = ?, "

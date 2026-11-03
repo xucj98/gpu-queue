@@ -87,9 +87,9 @@ def plan(pending, hosts, running=(), now=60., warmup=120.):
     return place(pending, gpus, history(gpus), running, now, warmup, hosts)
 
 
-def warming(job_id, started=50., cpus=3., ram=20., before_load=4., before_ram=100.):
+def warming(job_id, started=50., cpus=3., ram=20., before_cpu=4., before_ram=100.):
     return dict(job(job_id, cpus=cpus, ram=ram), host='a', gpus='', started=started,
-                launch_used='{}', launch_host=json.dumps({'load1': before_load, 'ram_available': before_ram}))
+                launch_used='{}', launch_host=json.dumps({'cpu_used': before_cpu, 'ram_available': before_ram}))
 
 
 def test_cpu_capacity_and_fractional_requests():
@@ -108,7 +108,7 @@ def test_ram_available_less_total_reserve():
     assert 'CPU' not in reasons[1]
 
 
-def test_same_poll_cannot_start_hundreds_before_load_rises():
+def test_same_poll_cannot_start_hundreds_before_cpu_rises():
     hosts = [Host('a', 8, 0., 100., 100.)]
     placements, reasons = plan([job(i, ngpus=0) for i in range(1, 457)], hosts)
     assert [p[0]['id'] for p in placements] == [1, 2, 3, 4]
@@ -139,10 +139,10 @@ def test_warmup_growth_is_credited_once_for_a_whole_batch():
 def test_warmup_overlapping_batches_and_measured_usage_above_declarations():
     hosts = [Host('a', 32, 9., 100., 87.)]
     running = [warming(1, started=40., cpus=3., ram=10.),
-               warming(2, started=50., cpus=3., ram=10., before_load=5., before_ram=97.)]
+               warming(2, started=50., cpus=3., ram=10., before_cpu=5., before_ram=97.)]
     cpu, ram = host_reservations(hosts, running, 60., 120.)
     assert cpu == {'a': 10.} and ram == {'a': 7.}
-    hosts[0].load1 = 15.
+    hosts[0].cpu_used = 15.
     hosts[0].ram_available = 70.
     cpu, ram = host_reservations(hosts, running, 60., 120.)
     assert cpu == {'a': 15.} and ram == {'a': 0.}
@@ -177,3 +177,21 @@ def test_missing_host_sample_does_not_use_stale_gpus():
     gpus = [gpu('a', 0, 0.)]
     placements, reasons = place([job(1)], gpus, history(gpus), [], 60., 120., [])
     assert not placements and 'CPU/RAM sample required' in reasons[1]
+
+
+def test_incomplete_cpu_window_blocks_only_the_sampling_host():
+    hosts = [Host('a', 56, None, 448., 440.), Host('b', 8, 0., 100., 90.)]
+    placements, reasons = plan([job(1, ngpus=0, hosts=['a']), job(2, ngpus=0)], hosts)
+    assert [(j['id'], h) for j, h, _ in placements] == [(2, 'b')]
+    assert 'CPU a: still sampling (60 s window)' in reasons[1]
+    _, reasons = plan([job(3, hosts=['a'])], hosts)
+    assert reasons[3] == 'CPU a: still sampling (60 s window)'
+
+
+def test_legacy_launch_cpu_does_not_contaminate_container_usage():
+    hosts = [Host('a', 56, .1, 448., 440.)]
+    running = [warming(1, cpus=2.)]
+    running[0]['launch_host'] = json.dumps({'load1': 100., 'ram_available': 440.})
+    cpu, _ = host_reservations(hosts, running, 60., 120.)
+    assert cpu['a'] == 2.1
+    assert plan([job(2, cpus=16.)], hosts, running)[0]

@@ -8,7 +8,9 @@ unless it is gone or a zombie (the containers' init does not reap orphans).
 """
 
 from dataclasses import dataclass
+import json
 import math
+from pathlib import Path
 import subprocess
 
 from gpu_queue.config import LOCAL
@@ -44,10 +46,13 @@ class Gpu:
 @dataclass
 class Host:
     host: str
-    cpus: int
-    load1: float
+    cpus: float
+    cpu_used: float | None
     ram_total: float       # GiB
     ram_available: float   # GiB, MemAvailable (includes reclaimable cache)
+    cpu_usage: int = 0      # cgroup cumulative CPU time, microseconds
+    cpu_time: float = 0.    # host monotonic timestamp
+    cpu_scope: str = ''     # cgroup identity; a replacement starts a fresh window
 
 
 # s; a heavily loaded host answers slowly, and a timeout marks it down until the next sample
@@ -65,8 +70,7 @@ echo ---
 pids={pids}
 [ -n "$pids" ] && ps -o pid=,stat= -p "$pids" 2>/dev/null | awk '$2 !~ /^Z/ {{print $1}}'
 echo ---
-getconf _NPROCESSORS_ONLN || exit 4
-cut -d ' ' -f 1 /proc/loadavg || exit 4
+python3 -c {cpu_probe} || exit 4
 awk '/^MemTotal:/ {{print $2 / 1048576}} /^MemAvailable:/ {{print $2 / 1048576}}' /proc/meminfo
 """
 
@@ -75,7 +79,9 @@ def sample(config, host, pids=()):
     """``(gpus, alive, resources)`` from one local/SSH command.
 
     One ``ps`` for all pids: a ``ps`` per pid outlasted the timeout with hundreds of running jobs."""
-    result = run(config, host, SAMPLE.format(pids=','.join(str(int(p)) for p in pids)), timeout=SAMPLE_TIMEOUT)
+    probe = Path(__file__).with_name('cpu_sample.py').read_text()
+    script = SAMPLE.format(pids=','.join(str(int(p)) for p in pids), cpu_probe=_quote(probe))
+    result = run(config, host, script, timeout=SAMPLE_TIMEOUT)
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout).strip().splitlines()[-1:] or f'exit {result.returncode}')
     gpu_part, app_part, alive_part, resource_part = result.stdout.split('---\n')
@@ -89,11 +95,13 @@ def sample(config, host, pids=()):
         index, uuid, name, total, used, util = [f.strip() for f in line.split(',')]
         gpus.append(Gpu(host, int(index), uuid, name, _gb(total), _gb(used), _number(util), apps.get(uuid, [])))
     alive = {int(p) for p in alive_part.split()}
-    cpus, load1, total, available = map(float, resource_part.split())
-    if not all(math.isfinite(v) for v in (cpus, load1, total, available)) or (
-            cpus <= 0 or load1 < 0 or total <= 0 or not 0 <= available <= total):
+    cpu_line, *memory = resource_part.strip().splitlines()
+    cpus, usage, stamp, scope = json.loads(cpu_line)
+    total, available = map(float, memory)
+    if not all(math.isfinite(v) for v in (cpus, usage, stamp, total, available)) or (
+            cpus <= 0 or usage < 0 or stamp < 0 or total <= 0 or not 0 <= available <= total):
         raise ValueError('invalid host CPU/RAM sample')
-    return gpus, alive, Host(host, int(cpus), load1, total, available)
+    return gpus, alive, Host(host, cpus, None, total, available, usage, stamp, scope)
 
 
 def _gb(mib):

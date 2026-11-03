@@ -60,24 +60,27 @@ def host_reservations(resources, running, now, warmup):
 
     Each launch sample anchors a *host-wide* reservation. Sum the declarations launched
     since that anchor, then credit the host's measured growth once, not once per job.
-    Taking the largest overlapping reservation also keeps pre-existing load accounted for.
+    Taking the largest overlapping reservation also keeps pre-existing CPU usage accounted for.
     Old jobs with no launch sample conservatively reserve their full declarations.
     """
     cpu, ram = {}, {}
     for host in resources:
         warming = [j for j in running if j['host'] == host.host and j['started'] is not None
                    and now - j['started'] <= warmup]
-        unknown = [j for j in warming if not j.get('launch_host')]
-        known = sorted((j for j in warming if j.get('launch_host')),
-                       key=lambda j: j['started'], reverse=True)
-        cpu_floor, ram_held, tail_cpu, tail_ram = host.load1, 0., 0., 0.
+        # Snapshots from older versions use a different CPU metric and cannot anchor this one.
+        known_jobs, unknown = [], []
+        for job in warming:
+            before = json.loads(job.get('launch_host') or '{}')
+            (known_jobs if before.get('cpu_used') is not None else unknown).append(job)
+        known = sorted(known_jobs, key=lambda j: j['started'], reverse=True)
+        cpu_floor, ram_held, tail_cpu, tail_ram = host.cpu_used, 0., 0., 0.
         for _, batch in groupby(known, key=lambda j: j['started']):
             batch = list(batch)
             tail_cpu += sum(j['cpus'] for j in batch)
             tail_ram += sum(j['ram'] for j in batch)
             for job in batch:
                 before = json.loads(job['launch_host'])
-                cpu_floor = max(cpu_floor, before['load1'] + tail_cpu)
+                cpu_floor = max(cpu_floor, before['cpu_used'] + tail_cpu)
                 gained = max(0., before['ram_available'] - host.ram_available)
                 ram_held = max(ram_held, tail_ram - gained)
         cpu[host.host] = cpu_floor + sum(j['cpus'] for j in unknown)
@@ -91,6 +94,8 @@ def place(pending, gpus, history, running, now, warmup, resources, cpu_target=.8
     Backfill is preserved: a job that does not fit never blocks later smaller jobs.
     The budgets below are decremented immediately, including within the same poll.
     """
+    sampling = {h.host for h in resources if h.cpu_used is None}
+    resources = [h for h in resources if h.cpu_used is not None]
     reserve = reserved(running, gpus, now, warmup)
     free = {(g.host, g.idx): g.total - g.used - reserve.get((g.host, g.idx), 0.) for g in gpus}
     cpu_used, ram_held = host_reservations(resources, running, now, warmup)
@@ -102,7 +107,9 @@ def place(pending, gpus, history, running, now, warmup, resources, cpu_target=.8
     placements, reasons = [], {}
     for job in sorted(pending, key=lambda job: (-job['priority'], job['id'])):
         allowed = json.loads(job['hosts']) if job['hosts'] else None
-        candidates, short_mem, busy, warming, host_reasons = [], 0, 0, 0, []
+        host_reasons = [f'CPU {host}: still sampling (60 s window)' for host in sorted(sampling)
+                        if not allowed or host in allowed]
+        candidates, short_mem, busy, warming = [], 0, 0, 0
         eligible = [h for h in resources if not allowed or h.host in allowed]
         for resource in eligible:
             host = resource.host
@@ -138,15 +145,15 @@ def place(pending, gpus, history, running, now, warmup, resources, cpu_target=.8
             ram_free[host] -= job['ram']
             placements.append((job, host, [gpu.idx for gpu in chosen]))
         else:
-            parts = host_reasons
-            if job['ngpus']:
+            parts = list(host_reasons)
+            if job['ngpus'] and eligible:
                 total = sum(len(by_host[h.host]) for h in eligible)
                 gpu_parts = [f'{short_mem} < {job["mem"]:g}G free'] if short_mem else []
                 gpu_parts += [f'{busy} busy (util >= {job["util"]:g}% in {job["window"]:g}s)'] if busy else []
                 gpu_parts += [f'{warming} still sampling'] if warming else []
                 if not total or gpu_parts:
                     parts.append(f'need {job["ngpus"]} GPU(s) on one host; of {total}: ' + ', '.join(gpu_parts))
-            reasons[job['id']] = '; '.join(parts) if eligible else 'no allowed host is up (CPU/RAM sample required)'
+            reasons[job['id']] = '; '.join(parts) if eligible or host_reasons else 'no allowed host is up (CPU/RAM sample required)'
             if not reasons[job['id']]:
                 reasons[job['id']] = f'need {job["ngpus"]} GPU(s) on one host'
     return placements, reasons
